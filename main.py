@@ -185,7 +185,6 @@ async def answer(request: Request):
         
         # Generate WebSocket token
         stream_token = make_ws_token()
-        token_encoded = quote_plus(stream_token)
         
         log_call_event("ANSWER_ENDPOINT", f"Generated stream token: {stream_token}")
         
@@ -202,16 +201,15 @@ async def answer(request: Request):
         # Brief pause
         response.pause(length=1)
         
-        # Connect to WebSocket stream with token in customParameters
+        # Connect to WebSocket stream with token in URL
         connect = response.connect()
         stream = connect.stream(
-            url=f"wss://{PUBLIC_HOST}/stream",
+            url=f"wss://{PUBLIC_HOST}/stream?token={stream_token}",
             track="inbound_track",
             name="ai_stream"
         )
-        stream.parameter(name="token", value=stream_token)
         
-        log_call_event("TWIML_GENERATED", f"TwiML response created with WebSocket URL: wss://{PUBLIC_HOST}/stream and customParameters token")
+        log_call_event("TWIML_GENERATED", f"TwiML response created with WebSocket URL: wss://{PUBLIC_HOST}/stream?token={stream_token}")
         
         return Response(str(response), media_type="application/xml")
         
@@ -224,7 +222,7 @@ async def answer(request: Request):
 async def stt_connect():
     """Connect to AssemblyAI realtime WebSocket"""
     try:
-        uri = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000&language=tr"
+        uri = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=8000&language=tr"
         ws = await websockets.connect(uri, extra_headers={"Authorization": ASSEMBLYAI_API_KEY})
         
         # Wait for initial message
@@ -248,12 +246,12 @@ async def stt_connect():
         logger.error(f"STT connection failed: {e}")
         raise
 
-async def stt_send_audio(ws_stt, pcm16_bytes):
+async def stt_send_audio(ws_stt, audio_bytes):
     """Send audio to STT service"""
     try:
-        audio_b64 = base64.b64encode(pcm16_bytes).decode()
+        audio_b64 = base64.b64encode(audio_bytes).decode()
         await ws_stt.send(json.dumps({"audio_data": audio_b64}))
-        log_call_event("STT_AUDIO_SENT", f"Audio sent to STT: {len(pcm16_bytes)} bytes")
+        log_call_event("STT_AUDIO_SENT", f"Audio sent to STT: {len(audio_bytes)} bytes")
     except Exception as e:
         log_call_event("STT_SEND_ERROR", f"Failed to send audio to STT: {str(e)}")
         logger.error(f"Failed to send audio to STT: {e}")
@@ -331,7 +329,7 @@ async def tts_synthesize(text) -> bytes:
         headers = {
             "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
             "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "raw-16khz-16bit-mono-pcm"
+            "X-Microsoft-OutputFormat": "raw-8khz-8bit-mono-pcm"
         }
         
         async with httpx.AsyncClient(timeout=60) as client:
@@ -348,11 +346,23 @@ async def tts_synthesize(text) -> bytes:
         logger.error(f"TTS synthesis failed: {e}")
         raise
 
-def pcm16_to_mulaw8k(pcm16_bytes) -> bytes:
-    """Convert PCM16 to μ-law 8kHz (placeholder implementation)"""
-    # TODO: Implement proper conversion
-    # For now, return a simple tone
-    return b"\x00" * len(pcm16_bytes)
+def pcm8_to_mulaw8k(pcm8_bytes) -> bytes:
+    """Convert PCM8 to μ-law 8kHz for Twilio compatibility"""
+    try:
+        # Simple conversion: PCM8 to μ-law
+        # This is a basic implementation - for production use a proper audio library
+        mulaw_bytes = bytearray()
+        for byte in pcm8_bytes:
+            # Convert 8-bit unsigned to μ-law (simplified)
+            if byte < 128:
+                mulaw_bytes.append(0x7F)  # Silence for low values
+            else:
+                mulaw_bytes.append(0x7F + (byte - 128) // 2)
+        return bytes(mulaw_bytes)
+    except Exception as e:
+        log_call_event("AUDIO_CONVERSION_ERROR", f"PCM8 to μ-law conversion failed: {str(e)}")
+        # Return silence if conversion fails
+        return b"\x7F" * len(pcm8_bytes)
 
 async def twilio_send_audio(ws_twilio, mulaw_bytes, stream_sid):
     """Send audio back to Twilio"""
@@ -377,29 +387,27 @@ async def stream_socket(websocket: WebSocket):
     await websocket.accept()
     log_call_event("WEBSOCKET_ACCEPTED", "WebSocket connection accepted")
     
-    # Extract and verify token - try both query params and customParameters
+    # Extract and verify token from query parameters
     token = websocket.query_params.get("token")
     log_call_event("WEBSOCKET_TOKEN_DEBUG", f"Token from query params: {token}")
     
-    decoded = None
-    if token:
-        try:
-            # Ensure token is string for JWT decode
-            if isinstance(token, bytes):
-                token = token.decode('utf-8')
-                log_call_event("WEBSOCKET_TOKEN_CONVERT", "Token converted from bytes to string")
-            
-            decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            log_call_event("WEBSOCKET_TOKEN_VERIFIED", f"Token verified from query params for user: {decoded.get('iss', 'unknown')}")
-        except Exception as e:
-            log_call_event("WEBSOCKET_TOKEN_ERROR_QUERY", f"Token from query params failed: {str(e)}")
-            decoded = None
+    if not token:
+        log_call_event("WEBSOCKET_ERROR", "No token provided in WebSocket connection")
+        await websocket.close(code=4003, reason="No token provided")
+        return
     
-    # If no token from query params, we'll try customParameters in the start event
-    if not decoded:
-        log_call_event("WEBSOCKET_TOKEN_DEBUG", "No valid token from query params, will try customParameters in start event")
-    
-    # Don't close connection here - wait for start event to check customParameters
+    try:
+        # Ensure token is string for JWT decode
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+            log_call_event("WEBSOCKET_TOKEN_CONVERT", "Token converted from bytes to string")
+        
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        log_call_event("WEBSOCKET_TOKEN_VERIFIED", f"Token verified for user: {decoded.get('iss', 'unknown')}")
+    except Exception as e:
+        log_call_event("WEBSOCKET_TOKEN_ERROR", f"Token verification failed: {str(e)}")
+        await websocket.close(code=4003, reason="Invalid token")
+        return
     
     # Initialize variables
     ws_stt = None
@@ -435,35 +443,13 @@ async def stream_socket(websocket: WebSocket):
                     stream_sid = data["start"]["streamSid"]
                     log_call_event("STREAM_STARTED", f"Stream started with SID: {stream_sid}")
                     
-                    # If no token verified yet, try customParameters
-                    if not decoded:
-                        params = data["start"].get("customParameters", {}) or {}
-                        cp_token = params.get("token")
-                        log_call_event("CUSTOM_PARAMS_DEBUG", f"Custom parameters: {params}")
-                        
-                        if cp_token:
-                            try:
-                                decoded = jwt.decode(cp_token, JWT_SECRET, algorithms=["HS256"])
-                                log_call_event("WEBSOCKET_TOKEN_VERIFIED", f"Token verified from customParameters for user: {decoded.get('iss', 'unknown')}")
-                            except Exception as e:
-                                log_call_event("WEBSOCKET_TOKEN_ERROR_CUSTOM_PARAMS", f"Token from customParameters failed: {str(e)}")
-                                await websocket.close(code=4003, reason="Invalid token in customParameters")
-                                return
-                    
-                    if not decoded:
-                        log_call_event("WEBSOCKET_ERROR", "No valid token provided in WebSocket connection (query or customParameters)")
-                        await websocket.close(code=4003, reason="No token provided")
-                        return
-                    
-                    log_call_event("TOKEN_FINAL_CHECK", "Token verification completed successfully")
-                    
                     # Send initial greeting via TTS
                     try:
                         initial_greeting = "Merhaba, ben su arıtma cihazınızın bakım asistanıyım. Size nasıl yardımcı olabilirim?"
                         pcm_greeting = await tts_synthesize(initial_greeting)
                         
                         if stream_sid:
-                            mulaw_greeting = pcm16_to_mulaw8k(pcm_greeting)
+                            mulaw_greeting = pcm8_to_mulaw8k(pcm_greeting)
                             await twilio_send_audio(websocket, mulaw_greeting, stream_sid)
                             log_call_event("INITIAL_GREETING_SENT", "Initial TTS greeting sent successfully")
                         else:
@@ -482,17 +468,8 @@ async def stream_socket(websocket: WebSocket):
                     
                     log_call_event("MEDIA_RECEIVED", f"Media event received - Audio length: {len(audio)} bytes")
                     
-                    # Convert μ-law to PCM16
-                    try:
-                        # For now, use placeholder conversion
-                        pcm16 = audio  # TODO: Implement proper conversion
-                        log_call_event("AUDIO_CONVERTED", f"Audio converted: {len(audio)} bytes")
-                    except Exception as e:
-                        log_call_event("AUDIO_CONVERSION_ERROR", f"Audio conversion failed: {str(e)}")
-                        continue
-                    
-                    # Send to STT
-                    await stt_send_audio(ws_stt, pcm16)
+                    # Send μ-law audio directly to STT (AssemblyAI supports μ-law)
+                    await stt_send_audio(ws_stt, audio)
                     
                     # Check for STT responses
                     try:
@@ -511,7 +488,7 @@ async def stream_socket(websocket: WebSocket):
                                     
                                     # Convert to μ-law and send back
                                     if stream_sid:
-                                        mulaw = pcm16_to_mulaw8k(pcm_bot)
+                                        mulaw = pcm8_to_mulaw8k(pcm_bot)
                                         await twilio_send_audio(websocket, mulaw, stream_sid)
                                         log_call_event("BOT_RESPONSE_SENT", f"Bot response sent: '{bot_response[:50]}...'")
                                     else:
