@@ -21,6 +21,7 @@ from slowapi.util import get_remote_address
 import jwt
 import httpx
 import websockets
+import audioop
 from urllib.parse import quote_plus
 
 # Configure comprehensive logging with timestamps
@@ -119,6 +120,29 @@ def filter_response(text):
     
     return text
 
+class AudioBridge:
+    def __init__(self):
+        self._up_state = None   # Twilio -> STT (upsample)
+        self._down_state = None # TTS -> Twilio (downsample)
+
+    # Twilio (μ-law 8k) -> PCM16 16k (AAI için)
+    def ulaw8k_to_pcm16_16k(self, ulaw_bytes: bytes) -> bytes:
+        pcm8k = audioop.ulaw2lin(ulaw_bytes, 2)             # μ-law 8k --> PCM16 8k
+        pcm16k, self._up_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, self._up_state)
+        return pcm16k
+
+    # TTS (PCM16 16k) -> μ-law 8k (Twilio için)
+    def pcm16_16k_to_ulaw8k(self, pcm16k_bytes: bytes) -> bytes:
+        pcm8k, self._down_state = audioop.ratecv(pcm16k_bytes, 2, 1, 16000, 8000, self._down_state)
+        ulaw8k = audioop.lin2ulaw(pcm8k, 2)
+        return ulaw8k
+
+def chunk_ulaw(ulaw_bytes: bytes, frame_ms=20, sps=8000):
+    """Split μ-law audio into 20ms frames for Twilio"""
+    frame = int(sps * frame_ms / 1000)  # 160 byte / 20ms
+    for i in range(0, len(ulaw_bytes), frame):
+        yield ulaw_bytes[i:i+frame]
+
 def log_call_event(event_type, details, call_sid=None):
     """Log call events with timestamps to callslog"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -205,7 +229,7 @@ async def answer(request: Request):
         connect = response.connect()
         stream = connect.stream(
             url=f"wss://{PUBLIC_HOST}/stream?token={stream_token}",
-            track="inbound_track",
+            track="both_tracks",   # <-- Çift yönlü ses akışı için
             name="ai_stream"
         )
         
@@ -222,7 +246,7 @@ async def answer(request: Request):
 async def stt_connect():
     """Connect to AssemblyAI realtime WebSocket"""
     try:
-        uri = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=8000&language=tr"
+        uri = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000&language=tr"
         ws = await websockets.connect(uri, extra_headers={"Authorization": ASSEMBLYAI_API_KEY})
         
         # Wait for initial message
@@ -329,7 +353,7 @@ async def tts_synthesize(text) -> bytes:
         headers = {
             "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
             "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "raw-8khz-8bit-mono-pcm"
+            "X-Microsoft-OutputFormat": "raw-16khz-16bit-mono-pcm"  # <-- Doğru format
         }
         
         async with httpx.AsyncClient(timeout=60) as client:
@@ -346,23 +370,7 @@ async def tts_synthesize(text) -> bytes:
         logger.error(f"TTS synthesis failed: {e}")
         raise
 
-def pcm8_to_mulaw8k(pcm8_bytes) -> bytes:
-    """Convert PCM8 to μ-law 8kHz for Twilio compatibility"""
-    try:
-        # Simple conversion: PCM8 to μ-law
-        # This is a basic implementation - for production use a proper audio library
-        mulaw_bytes = bytearray()
-        for byte in pcm8_bytes:
-            # Convert 8-bit unsigned to μ-law (simplified)
-            if byte < 128:
-                mulaw_bytes.append(0x7F)  # Silence for low values
-            else:
-                mulaw_bytes.append(0x7F + (byte - 128) // 2)
-        return bytes(mulaw_bytes)
-    except Exception as e:
-        log_call_event("AUDIO_CONVERSION_ERROR", f"PCM8 to μ-law conversion failed: {str(e)}")
-        # Return silence if conversion fails
-        return b"\x7F" * len(pcm8_bytes)
+
 
 async def twilio_send_audio(ws_twilio, mulaw_bytes, stream_sid):
     """Send audio back to Twilio"""
@@ -414,6 +422,7 @@ async def stream_socket(websocket: WebSocket):
     stream_sid = None
     last_audio_time = time.time()
     media_timeout = 30  # 30 seconds timeout for media events
+    bridge = AudioBridge()  # Audio conversion bridge
     
     try:
         # Connect to STT service
@@ -449,8 +458,10 @@ async def stream_socket(websocket: WebSocket):
                         pcm_greeting = await tts_synthesize(initial_greeting)
                         
                         if stream_sid:
-                            mulaw_greeting = pcm8_to_mulaw8k(pcm_greeting)
-                            await twilio_send_audio(websocket, mulaw_greeting, stream_sid)
+                            ulaw8k_greeting = bridge.pcm16_16k_to_ulaw8k(pcm_greeting)
+                            for frame in chunk_ulaw(ulaw8k_greeting):
+                                await twilio_send_audio(websocket, frame, stream_sid)
+                                await asyncio.sleep(0.02)  # 20ms delay between frames
                             log_call_event("INITIAL_GREETING_SENT", "Initial TTS greeting sent successfully")
                         else:
                             log_call_event("GREETING_ERROR", "Cannot send greeting: stream_sid is None")
@@ -468,8 +479,9 @@ async def stream_socket(websocket: WebSocket):
                     
                     log_call_event("MEDIA_RECEIVED", f"Media event received - Audio length: {len(audio)} bytes")
                     
-                    # Send μ-law audio directly to STT (AssemblyAI supports μ-law)
-                    await stt_send_audio(ws_stt, audio)
+                    # Convert μ-law 8k to PCM16 16k for AssemblyAI
+                    pcm16 = bridge.ulaw8k_to_pcm16_16k(audio)
+                    await stt_send_audio(ws_stt, pcm16)
                     
                     # Check for STT responses
                     try:
@@ -486,10 +498,12 @@ async def stream_socket(websocket: WebSocket):
                                     # Synthesize speech
                                     pcm_bot = await tts_synthesize(bot_response)
                                     
-                                    # Convert to μ-law and send back
+                                    # Convert PCM16 16k to μ-law 8k and send in 20ms frames
                                     if stream_sid:
-                                        mulaw = pcm8_to_mulaw8k(pcm_bot)
-                                        await twilio_send_audio(websocket, mulaw, stream_sid)
+                                        ulaw8k = bridge.pcm16_16k_to_ulaw8k(pcm_bot)
+                                        for frame in chunk_ulaw(ulaw8k):
+                                            await twilio_send_audio(websocket, frame, stream_sid)
+                                            await asyncio.sleep(0.02)  # 20ms delay between frames
                                         log_call_event("BOT_RESPONSE_SENT", f"Bot response sent: '{bot_response[:50]}...'")
                                     else:
                                         log_call_event("STREAM_SID_MISSING", "Cannot send audio: stream_sid is None")

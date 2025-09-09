@@ -3,12 +3,16 @@
 echo "🚀 Cloudflare Tunnel Başlatılıyor..."
 
 # Eski tunnel'ları durdur
-pkill -f cloudflared 2>/dev/null
+pkill -f cloudflared 2>/dev/null || true
 sleep 2
 
 # Yeni tunnel başlat ve URL'ini yakala
 echo "📡 Yeni tunnel oluşturuluyor..."
-TUNNEL_OUTPUT=$(cloudflared tunnel --url http://localhost:8000 2>&1)
+TUNNEL_OUTPUT=$(cloudflared tunnel --url http://localhost:8000 \
+  --config /tmp/cf-empty.yml \
+  --protocol quic \
+  --no-autoupdate \
+  --loglevel info 2>&1)
 
 # URL'ini çıkar
 TUNNEL_URL=$(echo "$TUNNEL_OUTPUT" | grep -o 'https://[^[:space:]]*\.trycloudflare\.com' | head -1)

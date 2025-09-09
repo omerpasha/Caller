@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, Response, HTTPException, Request, Depends
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from dotenv import load_dotenv
 import os
@@ -23,6 +24,7 @@ app = FastAPI()
 
 # Add middleware for proxy headers
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+app.add_middleware(ProxyHeadersMiddleware)
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
