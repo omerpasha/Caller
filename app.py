@@ -173,3 +173,67 @@ async def stream_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000) 
+# Webhook endpoint'leri
+@app.post("/webhook/call")
+async def webhook_call(data: dict):
+    """Dinamik arama webhook'u"""
+    try:
+        to_number = data.get("to_number")
+        agent_type = data.get("agent_type", "default")
+        custom_prompt = data.get("custom_prompt", "")
+        
+        if not to_number:
+            return {"error": "to_number is required"}
+        
+        # Arama başlat
+        call_result = await start_dynamic_call(to_number, agent_type, custom_prompt)
+        return {"status": "success", "call_id": call_result}
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/webhook/status")
+async def webhook_status(data: dict):
+    """Arama durumu webhook'u"""
+    try:
+        call_sid = data.get("call_sid")
+        status = data.get("status")
+        
+        print(f"Call {call_sid} status: {status}")
+        return {"status": "received"}
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/github/webhook")
+async def github_webhook(data: dict):
+    """GitHub webhook - otomatik deploy"""
+    try:
+        # GitHub'dan gelen değişiklikleri işle
+        print("GitHub webhook received")
+        
+        # Otomatik deploy (opsiyonel)
+        # subprocess.run(["git", "pull"])
+        # subprocess.run(["pip", "install", "-r", "requirements.txt"])
+        
+        return {"status": "success", "message": "GitHub webhook received"}
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+# Dinamik arama fonksiyonu
+async def start_dynamic_call(to_number: str, agent_type: str = "default", custom_prompt: str = ""):
+    """Dinamik arama başlat"""
+    try:
+        # Twilio ile arama yap
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=os.getenv('TWILIO_PHONE_NUMBER'),
+            url=f"https://{os.getenv('PUBLIC_HOST')}/answer"
+        )
+        
+        return call.sid
+        
+    except Exception as e:
+        print(f"Call error: {e}")
+        raise e
