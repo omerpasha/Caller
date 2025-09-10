@@ -496,10 +496,7 @@ async def stream_socket(websocket: WebSocket):
                                     bot_response = await llm_respond(user_text)
                                     
                                     # Synthesize speech
-                                    if os.getenv("USE_RETELL_TTS") == "1":
-                                        pcm_bot = await retell_tts_synthesize(bot_response)
-                                    else:
-                                        pcm_bot = await tts_synthesize(bot_response)
+                                    pcm_bot = await tts_synthesize(bot_response)
                                     
                                     # Convert PCM16 16k to μ-law 8k and send in 20ms frames
                                     if stream_sid:
@@ -548,37 +545,3 @@ async def stream_socket(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000) 
-async def retell_tts_synthesize(text) -> bytes:
-    """Synthesize speech using Retell.ai TTS"""
-    try:
-        log_call_event("RETELL_TTS_START", f"Retell TTS starting for text: '{text[:50]}...'")
-        
-        # Retell.ai API endpoint
-        url = "https://api.retellai.com/v2/create-phone-call"
-        headers = {
-            "Authorization": f"Bearer {os.getenv('RETELL_API_KEY')}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "text": text,
-            "voice": "tr-TR-EmelNeural",
-            "language": "tr-TR",
-            "output_format": "pcm_16k"
-        }
-        
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            
-            audio_bytes = r.content
-            log_call_event("RETELL_TTS_SUCCESS", f"Retell TTS successful, received {len(audio_bytes)} bytes of audio")
-            
-            return audio_bytes
-            
-    except Exception as e:
-        log_call_event("RETELL_TTS_ERROR", f"Retell TTS synthesis failed: {str(e)}")
-        logger.error(f"Retell TTS synthesis failed: {e}")
-        # Fallback to Azure TTS
-        return await tts_synthesize(text)
-
