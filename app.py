@@ -117,9 +117,11 @@ async def answer(request: Request):
 @app.websocket("/stream")
 async def stream_endpoint(websocket: WebSocket):
     """WebSocket köprüsü"""
-    # Verify token
+    # Verify token (can be bypassed for debugging)
     token = websocket.query_params.get("token")
-    if not token or not verify_stream_token(token):
+    if os.getenv("ALLOW_UNAUTH_STREAM") == "1":
+        pass
+    elif not token or not verify_stream_token(token):
         await websocket.close(code=4003)
         return
         
