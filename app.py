@@ -84,10 +84,11 @@ async def start_call(call_request: CallRequest, request: Request):
         stream_token = create_stream_token()
         
         # Twilio üzerinden arama başlat
+        answer_url = os.getenv('TWILIO_ANSWER_URL') or f"https://{os.getenv('PUBLIC_HOST')}/answer"
         call = twilio_client.calls.create(
             to=call_request.to_number,
             from_=os.getenv('TWILIO_PHONE_NUMBER'),
-            url=f"https://{os.getenv('PUBLIC_HOST')}/answer"
+            url=answer_url
         )
         return {"status": "success", "call_sid": call.sid}
     except Exception as e:
